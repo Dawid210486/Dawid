@@ -9,7 +9,6 @@ import (
 	"github.com/cli/cli/v2/pkg/cmd/attestation/api"
 	"github.com/cli/cli/v2/pkg/cmd/attestation/artifact"
 	"github.com/cli/cli/v2/pkg/cmd/attestation/artifact/oci"
-	"github.com/cli/cli/v2/pkg/cmd/attestation/auth"
 	"github.com/cli/cli/v2/pkg/cmd/attestation/io"
 	"github.com/cli/cli/v2/pkg/cmd/attestation/verification"
 	"github.com/cli/cli/v2/pkg/cmdutil"
@@ -101,9 +100,6 @@ func NewVerifyCmd(f *cmdutil.Factory, runF func(*Options) error) *cobra.Command 
 		// If an error is returned, its message will be printed to the terminal
 		// along with information about how use the command
 		PreRunE: func(cmd *cobra.Command, args []string) error {
-			// Create a logger for use throughout the verify command
-			opts.Logger = io.NewHandler(f.IOStreams)
-
 			// set the artifact path
 			opts.ArtifactPath = args[0]
 
@@ -118,53 +114,36 @@ func NewVerifyCmd(f *cmdutil.Factory, runF func(*Options) error) *cobra.Command 
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			hc, err := f.HttpClient()
+			// Create a logger for use throughout the verify command
+			logger := io.NewHandler(f.IOStreams)
+
+			apiClient, err := newAPIClient(f, opts.Hostname, logger)
 			if err != nil {
 				return err
 			}
 
-			opts.OCIClient = oci.NewLiveClient()
-
-			if opts.Hostname == "" {
-				opts.Hostname, _ = ghauth.DefaultHost()
-			}
-			err = auth.IsHostSupported(opts.Hostname)
-			if err != nil {
-				return err
-			}
-
-			opts.APIClient = api.NewLiveClient(hc, opts.Hostname, opts.Logger)
-
-			config := verification.SigstoreConfig{
+			sigstoreVerifier := &verification.LiveSigstoreVerifier{
+				Logger:       logger,
 				TrustedRoot:  opts.TrustedRoot,
-				Logger:       opts.Logger,
 				NoPublicGood: opts.NoPublicGood,
 			}
 
 			// Prepare for tenancy if detected
 			if ghauth.IsTenancy(opts.Hostname) {
-				td, err := opts.APIClient.GetTrustDomain()
+				trustDomain, tenant, err := configureTenancy(apiClient, opts.Hostname)
 				if err != nil {
 					return fmt.Errorf("error getting trust domain, make sure you are authenticated against the host: %w", err)
 				}
-
-				tenant, found := ghinstance.TenantName(opts.Hostname)
-				if !found {
-					return fmt.Errorf("invalid hostname provided: '%s'",
-						opts.Hostname)
-				}
-				config.TrustDomain = td
+				sigstoreVerifier.TrustDomain = trustDomain
 				opts.Tenant = tenant
 			}
 
+			// runF is only used for testing
 			if runF != nil {
 				return runF(opts)
 			}
 
-			opts.SigstoreVerifier = verification.NewLiveSigstoreVerifier(config)
-			opts.Config = f.Config
-
-			if err := runVerify(opts); err != nil {
+			if err := runVerify(opts, logger, apiClient, oci.NewLiveClient(), sigstoreVerifier); err != nil {
 				return fmt.Errorf("\nError: %v", err)
 			}
 			return nil
@@ -193,86 +172,88 @@ func NewVerifyCmd(f *cmdutil.Factory, runF func(*Options) error) *cobra.Command 
 	verifyCmd.Flags().StringVarP(&opts.SignerWorkflow, "signer-workflow", "", "", "Workflow that signed attestation in the format [host/]<owner>/<repo>/<path>/<to>/<workflow>")
 	verifyCmd.MarkFlagsMutuallyExclusive("cert-identity", "cert-identity-regex", "signer-repo", "signer-workflow")
 	verifyCmd.Flags().StringVarP(&opts.OIDCIssuer, "cert-oidc-issuer", "", verification.GitHubOIDCIssuer, "Issuer of the OIDC token")
-	verifyCmd.Flags().StringVarP(&opts.Hostname, "hostname", "", "", "Configure host to use")
+	// Set the default gh hostname as the option's default value
+	hostname, _ := ghauth.DefaultHost()
+	verifyCmd.Flags().StringVarP(&opts.Hostname, "hostname", "", hostname, "Configure host to use")
 
 	return verifyCmd
 }
 
-func runVerify(opts *Options) error {
+func runVerify(opts *Options, logger *io.Handler, apiClient api.Client, ociClient oci.Client, sgVerifier verification.SigstoreVerifier) error {
 	ec, err := newEnforcementCriteria(opts)
 	if err != nil {
-		opts.Logger.Println(opts.Logger.ColorScheme.Red("✗ Failed to build verification policy"))
+		logger.Println(logger.ColorScheme.Red("✗ Failed to build verification policy"))
 		return err
 	}
 
 	if err := ec.Valid(); err != nil {
-		opts.Logger.Println(opts.Logger.ColorScheme.Red("✗ Invalid verification policy"))
+		logger.Println(logger.ColorScheme.Red("✗ Invalid verification policy"))
 		return err
 	}
 
-	artifact, err := artifact.NewDigestedArtifact(opts.OCIClient, opts.ArtifactPath, opts.DigestAlgorithm)
+	artifact, err := artifact.NewDigestedArtifact(ociClient, opts.ArtifactPath, opts.DigestAlgorithm)
 	if err != nil {
-		opts.Logger.Printf(opts.Logger.ColorScheme.Red("✗ Loading digest for %s failed\n"), opts.ArtifactPath)
+		logger.Printf(logger.ColorScheme.Red("✗ Loading digest for %s failed\n"), opts.ArtifactPath)
 		return err
 	}
 
-	opts.Logger.Printf("Loaded digest %s for %s\n", artifact.DigestWithAlg(), artifact.URL)
+	logger.Printf("Loaded digest %s for %s\n", artifact.DigestWithAlg(), artifact.URL)
 
-	attestations, logMsg, err := getAttestations(opts, *artifact)
+	attestations, logMsg, err := getAttestations(opts, *artifact, ociClient, apiClient)
 	if err != nil {
 		if ok := errors.Is(err, api.ErrNoAttestations{}); ok {
-			opts.Logger.Printf(opts.Logger.ColorScheme.Red("✗ No attestations found for subject %s\n"), artifact.DigestWithAlg())
+			logger.Printf(logger.ColorScheme.Red("✗ No attestations found for subject %s\n"), artifact.DigestWithAlg())
 			return err
 		}
 		// Print the message signifying failure fetching attestations
-		opts.Logger.Println(opts.Logger.ColorScheme.Red(logMsg))
+		logger.Println(logger.ColorScheme.Red(logMsg))
 		return err
 	}
 	// Print the message signifying success fetching attestations
-	opts.Logger.Println(logMsg)
+	logger.Println(logMsg)
 
 	// Apply predicate type filter to returned attestations
 	filteredAttestations := verification.FilterAttestations(ec.PredicateType, attestations)
 	if len(filteredAttestations) == 0 {
-		opts.Logger.Printf(opts.Logger.ColorScheme.Red("✗ No attestations found with predicate type: %s\n"), opts.PredicateType)
+		logger.Printf(logger.ColorScheme.Red("✗ No attestations found with predicate type: %s\n"), opts.PredicateType)
 		return err
 	}
 	attestations = filteredAttestations
 
 	// print information about the policy that will be enforced against attestations
-	opts.Logger.Println("\nThe following policy criteria will be enforced:")
-	opts.Logger.Println(ec.BuildPolicyInformation())
+	logger.Println("\nThe following policy criteria will be enforced:")
+	logger.Println(ec.BuildPolicyInformation())
 
-	verified, errMsg, err := verifyAttestations(*artifact, attestations, opts.SigstoreVerifier, ec)
+	verified, errMsg, err := verifyAttestations(*artifact, attestations, sgVerifier, ec)
 	if err != nil {
-		opts.Logger.Println(opts.Logger.ColorScheme.Red(errMsg))
+		logger.Println(logger.ColorScheme.Red(errMsg))
 		return err
 	}
 
-	opts.Logger.Println(opts.Logger.ColorScheme.Green("✓ Verification succeeded!\n"))
+	logger.Println(logger.ColorScheme.Green("✓ Verification succeeded!\n"))
 
 	// If an exporter is provided with the --json flag, write the results to the terminal in JSON format
 	if opts.exporter != nil {
 		// print the results to the terminal as an array of JSON objects
-		if err = opts.exporter.Write(opts.Logger.IO, verified); err != nil {
-			opts.Logger.Println(opts.Logger.ColorScheme.Red("✗ Failed to write JSON output"))
+		if err = opts.exporter.Write(logger.IO, verified); err != nil {
+			logger.Println(logger.ColorScheme.Red("✗ Failed to write JSON output"))
 			return err
 		}
 		return nil
 	}
 
-	opts.Logger.Printf("%s was attested by:\n", artifact.DigestWithAlg())
+	logger.Printf("%s was attested by:\n", artifact.DigestWithAlg())
 
 	// Otherwise print the results to the terminal in a table
 	tableContent, err := buildTableVerifyContent(opts.Tenant, verified)
 	if err != nil {
-		opts.Logger.Println(opts.Logger.ColorScheme.Red("failed to parse results"))
+		logger.Println(logger.ColorScheme.Red("failed to parse results"))
 		return err
 	}
 
 	headers := []string{"repo", "predicate_type", "workflow"}
-	if err = opts.Logger.PrintTable(headers, tableContent); err != nil {
-		opts.Logger.Println(opts.Logger.ColorScheme.Red("failed to print attestation details to table"))
+	if err = logger.PrintTable(headers, tableContent); err != nil {
+		logger.Println(logger.ColorScheme.Red("failed to print attestation details to table"))
 		return err
 	}
 
@@ -339,4 +320,26 @@ func buildTableVerifyContent(tenant string, results []*verification.AttestationP
 	}
 
 	return content, nil
+}
+
+func newAPIClient(f *cmdutil.Factory, hostname string, logger *io.Handler) (api.Client, error) {
+	hc, err := f.HttpClient()
+	if err != nil {
+		return nil, err
+	}
+	return api.NewLiveClient(hc, hostname, logger), nil
+}
+
+// configure tenancy if detected
+func configureTenancy(apiClient api.Client, hostname string) (string, string, error) {
+	td, err := apiClient.GetTrustDomain()
+	if err != nil {
+		return "", "", fmt.Errorf("error getting trust domain, make sure you are authenticated against the host: %w", err)
+	}
+
+	tenant, found := ghinstance.TenantName(hostname)
+	if !found {
+		return "", "", fmt.Errorf("invalid hostname provided: '%s'", hostname)
+	}
+	return td, tenant, nil
 }
