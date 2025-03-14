@@ -46,16 +46,18 @@ type Repository struct {
 	UpdatedAt  time.Time
 	ArchivedAt *time.Time
 
-	IsBlankIssuesEnabled    bool
-	IsSecurityPolicyEnabled bool
-	HasIssuesEnabled        bool
-	HasProjectsEnabled      bool
-	HasDiscussionsEnabled   bool
-	HasWikiEnabled          bool
-	MergeCommitAllowed      bool
-	SquashMergeAllowed      bool
-	RebaseMergeAllowed      bool
-	AutoMergeAllowed        bool
+	IsBlankIssuesEnabled     bool
+	IsSecurityPolicyEnabled  bool
+	HasIssuesEnabled         bool
+	HasProjectsEnabled       bool
+	HasDiscussionsEnabled    bool
+	HasWikiEnabled           bool
+	MergeCommitAllowed       bool
+	SquashMergeAllowed       bool
+	RebaseMergeAllowed       bool
+	AutoMergeAllowed         bool
+	SquashMergeCommitTitle   string
+	SquashMergeCommitMessage string
 
 	ForkCount      int
 	StargazerCount int

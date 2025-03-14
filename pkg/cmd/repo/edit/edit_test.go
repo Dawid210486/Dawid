@@ -91,6 +91,39 @@ func TestNewCmdEdit(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "deny squash-merge-commit-title change without squash-merge-commit-message",
+			args: "--squash-merge-commit-title PR_TITLE",
+			wantOpts: EditOptions{
+				Repository: ghrepo.NewWithHost("OWNER", "REPO", "github.com"),
+				Edits: EditRepositoryInput{
+					SquashMergeCommitMessage: "PR_BODY",
+				},
+			},
+			wantErr: "use of --squash-merge-commit-title requires --squash-merge-commit-message flag",
+		},
+		{
+			name: "deny squash-merge-commit-message change without squash-merge-commit-title",
+			args: "--squash-merge-commit-message PR_BODY",
+			wantOpts: EditOptions{
+				Repository: ghrepo.NewWithHost("OWNER", "REPO", "github.com"),
+				Edits: EditRepositoryInput{
+					SquashMergeCommitTitle: "PR_TITLE",
+				},
+			},
+			wantErr: "use of --squash-merge-commit-message requires --squash-merge-commit-title flag",
+		},
+		{
+			name: "allow squash-merge-commit-title with squash-merge-commit-message",
+			args: "--squash-merge-commit-title PR_TITLE --squash-merge-commit-message PR_BODY",
+			wantOpts: EditOptions{
+				Repository: ghrepo.NewWithHost("OWNER", "REPO", "github.com"),
+				Edits: EditRepositoryInput{
+					SquashMergeCommitMessage: "PR_BODY",
+					SquashMergeCommitTitle:   "PR_TITLE",
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -646,7 +679,7 @@ func Test_editRun_interactive(t *testing.T) {
 				pm.RegisterMultiSelect("Allowed merge strategies", nil,
 					[]string{allowMergeCommits, allowSquashMerge, allowRebaseMerge},
 					func(_ string, _, opts []string) ([]int, error) {
-						return []int{0, 2}, nil
+						return []int{0, 1}, nil
 					})
 				pm.RegisterConfirm("Enable Auto Merge?", func(_ string, _ bool) (bool, error) {
 					return false, nil
@@ -654,6 +687,16 @@ func Test_editRun_interactive(t *testing.T) {
 				pm.RegisterConfirm("Automatically delete head branches after merging?", func(_ string, _ bool) (bool, error) {
 					return false, nil
 				})
+				pm.RegisterSelect("Default squash merge commit title",
+					[]string{"PR_TITLE", "COMMIT_OR_PR_TITLE"},
+					func(_, _ string, opts []string) (int, error) {
+						return prompter.IndexFor(opts, "PR_TITLE")
+					})
+				pm.RegisterSelect("Default squash merge commit message",
+					[]string{"PR_BODY", "COMMIT_MESSAGES", "BLANK"},
+					func(_, _ string, opts []string) (int, error) {
+						return prompter.IndexFor(opts, "PR_BODY")
+					})
 			},
 			httpStubs: func(t *testing.T, reg *httpmock.Registry) {
 				reg.Register(
@@ -672,6 +715,8 @@ func Test_editRun_interactive(t *testing.T) {
 								"rebaseMergeAllowed": true,
 								"mergeCommitAllowed": true,
 								"deleteBranchOnMerge": false,
+								"squashMergeCommitTitle": "COMMIT_OR_PR_TITLE",
+								"squashMergeCommitMessage": "COMMIT_MESSAGES",
 								"repositoryTopics": {
 									"nodes": [{
 										"topic": {
@@ -686,8 +731,10 @@ func Test_editRun_interactive(t *testing.T) {
 					httpmock.REST("PATCH", "repos/OWNER/REPO"),
 					httpmock.RESTPayload(200, `{}`, func(payload map[string]interface{}) {
 						assert.Equal(t, true, payload["allow_merge_commit"])
-						assert.Equal(t, false, payload["allow_squash_merge"])
-						assert.Equal(t, true, payload["allow_rebase_merge"])
+						assert.Equal(t, true, payload["allow_squash_merge"])
+						assert.Equal(t, false, payload["allow_rebase_merge"])
+						assert.Equal(t, "PR_TITLE", payload["squash_merge_commit_title"])
+						assert.Equal(t, "PR_BODY", payload["squash_merge_commit_message"])
 					}))
 			},
 		},

@@ -70,23 +70,25 @@ type EditRepositoryInput struct {
 	enableSecretScanning               *bool
 	enableSecretScanningPushProtection *bool
 
-	AllowForking        *bool                     `json:"allow_forking,omitempty"`
-	AllowUpdateBranch   *bool                     `json:"allow_update_branch,omitempty"`
-	DefaultBranch       *string                   `json:"default_branch,omitempty"`
-	DeleteBranchOnMerge *bool                     `json:"delete_branch_on_merge,omitempty"`
-	Description         *string                   `json:"description,omitempty"`
-	EnableAutoMerge     *bool                     `json:"allow_auto_merge,omitempty"`
-	EnableIssues        *bool                     `json:"has_issues,omitempty"`
-	EnableMergeCommit   *bool                     `json:"allow_merge_commit,omitempty"`
-	EnableProjects      *bool                     `json:"has_projects,omitempty"`
-	EnableDiscussions   *bool                     `json:"has_discussions,omitempty"`
-	EnableRebaseMerge   *bool                     `json:"allow_rebase_merge,omitempty"`
-	EnableSquashMerge   *bool                     `json:"allow_squash_merge,omitempty"`
-	EnableWiki          *bool                     `json:"has_wiki,omitempty"`
-	Homepage            *string                   `json:"homepage,omitempty"`
-	IsTemplate          *bool                     `json:"is_template,omitempty"`
-	SecurityAndAnalysis *SecurityAndAnalysisInput `json:"security_and_analysis,omitempty"`
-	Visibility          *string                   `json:"visibility,omitempty"`
+	AllowForking             *bool                     `json:"allow_forking,omitempty"`
+	AllowUpdateBranch        *bool                     `json:"allow_update_branch,omitempty"`
+	DefaultBranch            *string                   `json:"default_branch,omitempty"`
+	DeleteBranchOnMerge      *bool                     `json:"delete_branch_on_merge,omitempty"`
+	Description              *string                   `json:"description,omitempty"`
+	EnableAutoMerge          *bool                     `json:"allow_auto_merge,omitempty"`
+	EnableIssues             *bool                     `json:"has_issues,omitempty"`
+	EnableMergeCommit        *bool                     `json:"allow_merge_commit,omitempty"`
+	EnableProjects           *bool                     `json:"has_projects,omitempty"`
+	EnableDiscussions        *bool                     `json:"has_discussions,omitempty"`
+	EnableRebaseMerge        *bool                     `json:"allow_rebase_merge,omitempty"`
+	EnableSquashMerge        *bool                     `json:"allow_squash_merge,omitempty"`
+	EnableWiki               *bool                     `json:"has_wiki,omitempty"`
+	Homepage                 *string                   `json:"homepage,omitempty"`
+	IsTemplate               *bool                     `json:"is_template,omitempty"`
+	SecurityAndAnalysis      *SecurityAndAnalysisInput `json:"security_and_analysis,omitempty"`
+	SquashMergeCommitTitle   string                    `json:"squash_merge_commit_title,omitempty"`
+	SquashMergeCommitMessage string                    `json:"squash_merge_commit_message,omitempty"`
+	Visibility               *string                   `json:"visibility,omitempty"`
 }
 
 func NewCmdEdit(f *cmdutil.Factory, runF func(options *EditOptions) error) *cobra.Command {
@@ -162,6 +164,12 @@ func NewCmdEdit(f *cmdutil.Factory, runF func(options *EditOptions) error) *cobr
 				return cmdutil.FlagErrorf("use of --visibility flag requires --accept-visibility-change-consequences flag")
 			}
 
+			if opts.Edits.SquashMergeCommitTitle == "" && opts.Edits.SquashMergeCommitMessage != "" {
+				return cmdutil.FlagErrorf("use of --squash-merge-commit-message requires --squash-merge-commit-title flag")
+			} else if opts.Edits.SquashMergeCommitTitle != "" && opts.Edits.SquashMergeCommitMessage == "" {
+				return cmdutil.FlagErrorf("use of --squash-merge-commit-title requires --squash-merge-commit-message flag")
+			}
+
 			if hasSecurityEdits(opts.Edits) {
 				opts.Edits.SecurityAndAnalysis = transformSecurityAndAnalysisOpts(opts)
 			}
@@ -192,6 +200,8 @@ func NewCmdEdit(f *cmdutil.Factory, runF func(options *EditOptions) error) *cobr
 	cmdutil.NilBoolFlag(cmd, &opts.Edits.DeleteBranchOnMerge, "delete-branch-on-merge", "", "Delete head branch when pull requests are merged")
 	cmdutil.NilBoolFlag(cmd, &opts.Edits.AllowForking, "allow-forking", "", "Allow forking of an organization repository")
 	cmdutil.NilBoolFlag(cmd, &opts.Edits.AllowUpdateBranch, "allow-update-branch", "", "Allow a pull request head branch that is behind its base branch to be updated")
+	cmdutil.StringEnumFlag(cmd, &opts.Edits.SquashMergeCommitTitle, "squash-merge-commit-title", "", "", []string{"PR_TITLE", "COMMIT_OR_PR_TITLE"}, "The default value for a squash merge commit title")
+	cmdutil.StringEnumFlag(cmd, &opts.Edits.SquashMergeCommitMessage, "squash-merge-commit-message", "", "", []string{"PR_BODY", "COMMIT_MESSAGES", "BLANK"}, "The default value for a squash merge commit message")
 	cmd.Flags().StringSliceVar(&opts.AddTopics, "add-topic", nil, "Add repository topic")
 	cmd.Flags().StringSliceVar(&opts.RemoveTopics, "remove-topic", nil, "Remove repository topic")
 	cmd.Flags().BoolVar(&opts.AcceptVisibilityChangeConsequences, "accept-visibility-change-consequences", false, "Accept the consequences of changing the repository visibility")
@@ -231,6 +241,8 @@ func editRun(ctx context.Context, opts *EditOptions) error {
 			"repositoryTopics",
 			"stargazerCount",
 			"squashMergeAllowed",
+			"squashMergeCommitTitle",
+			"squashMergeCommitMessage",
 			"watchers",
 		}
 		if repoFeatures.VisibilityField {
@@ -486,6 +498,27 @@ func interactiveRepoEdit(opts *EditOptions, r *api.Repository) error {
 				return err
 			}
 			opts.Edits.DeleteBranchOnMerge = &c
+
+			if enableSquashMerge {
+				squashMergeCommitTitleOpts := []string{"PR_TITLE", "COMMIT_OR_PR_TITLE"}
+				selectedTitle, err := p.Select(
+					"Default squash merge commit title",
+					r.SquashMergeCommitTitle,
+					squashMergeCommitTitleOpts)
+				if err != nil {
+					return err
+				}
+				opts.Edits.SquashMergeCommitTitle = squashMergeCommitTitleOpts[selectedTitle]
+				squashMergeCommitMessageOpts := []string{"PR_BODY", "COMMIT_MESSAGES", "BLANK"}
+				selectedMessage, err := p.Select(
+					"Default squash merge commit message",
+					r.SquashMergeCommitMessage,
+					squashMergeCommitMessageOpts)
+				if err != nil {
+					return err
+				}
+				opts.Edits.SquashMergeCommitMessage = squashMergeCommitMessageOpts[selectedMessage]
+			}
 		case optionTemplateRepo:
 			c, err := p.Confirm("Convert into a template repository?", r.IsTemplate)
 			if err != nil {
