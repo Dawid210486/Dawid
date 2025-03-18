@@ -571,13 +571,13 @@ func NewCreateContext(opts *CreateOptions) (*CreateContext, error) {
 	}
 
 	// Resolve base repo
-	repoContext, err := ghContext.ResolveRemotesToRepos(remotes, client, opts.RepoOverride)
+	resolvedRemotes, err := ghContext.ResolveRemotesToRepos(remotes, client, opts.RepoOverride)
 	if err != nil {
 		return nil, err
 	}
 
 	var targetBaseRepo *api.Repository
-	if br, err := repoContext.BaseRepo(opts.IO); err == nil {
+	if br, err := resolvedRemotes.BaseRepo(opts.IO); err == nil {
 		if r, ok := br.(*api.Repository); ok {
 			targetBaseRepo = r
 		} else {
@@ -622,20 +622,10 @@ func NewCreateContext(opts *CreateOptions) (*CreateContext, error) {
 		return nil, err
 	}
 
-	// See if we can determine if this branch has been push previously with
-	// Git configurations and @{push} revision syntax.
-	remotePushDefault, err := opts.GitClient.RemotePushDefault(ctx)
-	if err != nil {
-		return nil, err
-	}
-	// Suppressing these errors as we have other means of computing the PullRequestRefs when these fail.
-	parsedPushRevision, _ := gitClient.ParsePushRevision(ctx, targetHeadBranch)
-	pushDefault, err := gitClient.PushDefault(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	prRefs, err := shared.ParsePRRefs(targetHeadBranch, targetHeadBranchConfig, parsedPushRevision, pushDefault, remotePushDefault, targetBaseRepo, remotes)
+	prRefs, err := shared.ResolvePRRefs(gitClientWithCachedBranchConfig{
+		cachedBranchConfig: targetHeadBranchConfig,
+		Client:             gitClient,
+	}, remotes, targetBaseRepo, targetHeadBranch)
 	if err != nil {
 		return nil, err
 	}
@@ -648,7 +638,7 @@ func NewCreateContext(opts *CreateOptions) (*CreateContext, error) {
 
 	var headRemote *ghContext.Remote
 
-	// We received the head repository and branch from ParsePRRefs, or inferred
+	// We received the head repository and branch from ResolvePRRefs, or inferred
 	// it from --head input, but we need to check if it's up-to-date with
 	// our local branch state.
 	// If it is, we can use it as the head repo for the PR
@@ -685,7 +675,7 @@ func NewCreateContext(opts *CreateOptions) (*CreateContext, error) {
 		isPushEnabled = true
 		// Since we could not determine a head ref, prompt the user for the head repository to push
 		// using a list of repositories obtained from the API
-		pushableRepos, err := repoContext.HeadRepos()
+		pushableRepos, err := resolvedRemotes.HeadRepos()
 		if err != nil {
 			return nil, err
 		}
@@ -763,7 +753,7 @@ func NewCreateContext(opts *CreateOptions) (*CreateContext, error) {
 		HeadRemote:         headRemote,
 		isPushEnabled:      isPushEnabled,
 		forkHeadRepo:       forkHeadRepo,
-		RepoContext:        repoContext,
+		RepoContext:        resolvedRemotes,
 		Client:             client,
 		GitClient:          gitClient,
 	}, nil
@@ -1079,3 +1069,13 @@ func requestableReviewersForCompletion(opts *CreateOptions) ([]string, error) {
 }
 
 var gitPushRegexp = regexp.MustCompile("^remote: (Create a pull request.*by visiting|[[:space:]]*https://.*/pull/new/).*\n?$")
+
+// Since ResolvePRRefs also reads the branch config, let's just cache our previous read.
+type gitClientWithCachedBranchConfig struct {
+	cachedBranchConfig git.BranchConfig
+	*git.Client
+}
+
+func (c gitClientWithCachedBranchConfig) ReadBranchConfig(ctx context.Context, branchName string) (git.BranchConfig, error) {
+	return c.cachedBranchConfig, nil
+}
