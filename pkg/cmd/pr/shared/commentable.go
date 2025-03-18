@@ -18,6 +18,7 @@ import (
 )
 
 var errNoUserComments = errors.New("no comments found for current user")
+var errDeleteNotConfirmed = errors.New("deletion not confirmed")
 
 type InputType int
 
@@ -41,11 +42,14 @@ type CommentableOptions struct {
 	InteractiveEditSurvey     func(string) (string, error)
 	ConfirmSubmitSurvey       func() (bool, error)
 	ConfirmCreateIfNoneSurvey func() (bool, error)
+	ConfirmDeleteComment      func(string) (bool, error)
 	OpenInBrowser             func(string) error
 	Interactive               bool
 	InputType                 InputType
 	Body                      string
 	EditLast                  bool
+	DeleteLast                bool
+	Confirmed                 bool
 	CreateIfNone              bool
 	Quiet                     bool
 	Host                      string
@@ -92,6 +96,9 @@ func CommentableRun(opts *CommentableOptions) error {
 		return err
 	}
 	opts.Host = repo.RepoHost()
+	if opts.DeleteLast {
+		return deleteComment(commentable, opts)
+	}
 	if opts.EditLast {
 		err := updateComment(commentable, opts)
 		if !errors.Is(err, errNoUserComments) {
@@ -225,6 +232,50 @@ func updateComment(commentable Commentable, opts *CommentableOptions) error {
 	return nil
 }
 
+func deleteComment(commentable Commentable, opts *CommentableOptions) error {
+	comments := commentable.CurrentUserComments()
+	if len(comments) == 0 {
+		return errNoUserComments
+	}
+
+	lastComment := &comments[len(comments)-1]
+
+	cs := opts.IO.ColorScheme()
+
+	if (opts.IO.CanPrompt() && !opts.Confirmed) {
+		if opts.Interactive {
+			fmt.Fprintf(opts.IO.Out, "%s Deleted comments cannot be recovered.\n", cs.WarningIcon())
+			ok, err := opts.ConfirmDeleteComment(lastComment.Body)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errDeleteNotConfirmed
+			}
+		} else {
+			return errors.New("you must use --yes flag to confirm deletion in non-interactive mode")
+		}
+	}
+
+	httpClient, err := opts.HttpClient()
+	if err != nil {
+		return err
+	}
+
+	apiClient := api.NewClientFromHTTP(httpClient)
+	params := api.CommentDeleteInput{CommentId: lastComment.Identifier()}
+	deletionErr := api.CommentDelete(apiClient, opts.Host, params)
+	if deletionErr != nil {
+		return deletionErr
+	}
+
+	if !opts.Quiet {
+		fmt.Fprintln(opts.IO.Out, "Deleted the comment successfully.")
+	}
+
+	return nil
+}
+
 func CommentableConfirmSubmitSurvey(p Prompt) func() (bool, error) {
 	return func() (bool, error) {
 		return p.Confirm("Submit?", true)
@@ -257,6 +308,12 @@ func CommentableEditSurvey(cf func() (gh.Config, error), io *iostreams.IOStreams
 			return "", err
 		}
 		return surveyext.Edit(editorCommand, "*.md", initialValue, io.In, io.Out, io.ErrOut)
+	}
+}
+
+func CommentableConfirmDeleteComment(p Prompt) func(string) (bool, error) {
+	return func(body string) (bool, error) {
+		return p.Confirm(fmt.Sprintf("Deleting the comment with a body: '%s'.", body), true)
 	}
 }
 
