@@ -132,6 +132,15 @@ var prCommits = shortenQuery(`
 	}
 `)
 
+var prClosingIssuesReferences = shortenQuery(`
+	closingIssuesReferences(first: 100) {
+		nodes {
+			number
+		}
+		pageInfo{hasNextPage,endCursor}
+	}
+`)
+
 var autoMergeRequest = shortenQuery(`
 	autoMergeRequest {
 		authorEmail,
@@ -287,6 +296,7 @@ var PullRequestFields = append(sharedIssuePRFields,
 	"baseRefName",
 	"baseRefOid",
 	"changedFiles",
+	"closingIssuesReferences",
 	"commits",
 	"deletions",
 	"files",
@@ -366,6 +376,8 @@ func IssueGraphQL(fields []string) string {
 			q = append(q, StatusCheckRollupGraphQLWithoutCountByState(""))
 		case "statusCheckRollupWithCountByState": // pseudo-field
 			q = append(q, StatusCheckRollupGraphQLWithCountByState())
+		case "closingIssuesReferences":
+			q = append(q, prClosingIssuesReferences)
 		default:
 			q = append(q, field)
 		}
