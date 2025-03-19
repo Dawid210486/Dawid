@@ -279,10 +279,19 @@ func createRun(opts *CreateOptions) error {
 	var openURL string
 
 	if opts.WebMode {
+
 		if !(opts.Autofill || opts.FillFirst) {
 			state.Title = opts.Title
 			state.Body = opts.Body
 		}
+
+		if opts.TitleProvided {
+			state.Title = opts.Title
+		}
+		if opts.BodyProvided {
+			state.Body = opts.Body
+		}
+
 		if opts.Template != "" {
 			state.Template = opts.Template
 		}
