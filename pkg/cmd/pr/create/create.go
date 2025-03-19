@@ -76,14 +76,12 @@ type CreateContext struct {
 	// This struct stores contextual data about the creation process and is for building up enough
 	// data to create a pull request
 	RepoContext        *ghContext.ResolvedRemotes
-	BaseRepo           *api.Repository
-	HeadRepo           ghrepo.Interface
+	PrRefs             shared.PullRequestRefs
 	BaseTrackingBranch string
-	BaseBranch         string
-	HeadBranch         string
-	HeadBranchLabel    string
+	BaseBranch         string // Currently not supported by shared.PullRequestRefs struct
 	HeadRemote         *ghContext.Remote
-	IsPushEnabled      bool
+	isPushEnabled      bool
+	forkHeadRepo       bool
 	Client             *api.Client
 	GitClient          *git.Client
 }
@@ -112,6 +110,10 @@ func NewCmdCreate(f *cmdutil.Factory, runF func(*CreateOptions) error) *cobra.Co
 			When the current branch isn't fully pushed to a git remote, a prompt will ask where
 			to push the branch and offer an option to fork the base repository. Use %[1]s--head%[1]s to
 			explicitly skip any forking or pushing behavior.
+
+			%[1]s--head%[1]s supports %[1]s<user>:<branch>%[1]s syntax to select a head repo owned by %[1]s<user>%[1]s.
+			Using an organization as the %[1]s<user>%[1]s is currently not supported.
+			For more information, see <https://github.com/cli/cli/issues/10093>
 
 			A prompt will also ask for the title and the body of the pull request. Use %[1]s--title%[1]s and
 			%[1]s--body%[1]s to skip this, or use %[1]s--fill%[1]s to autofill these values from git commits.
@@ -310,7 +312,7 @@ func createRun(opts *CreateOptions) error {
 	}
 
 	existingPR, _, err := opts.Finder.Find(shared.FindOptions{
-		Selector:   ctx.HeadBranchLabel,
+		Selector:   ctx.PrRefs.GetPRHeadLabel(),
 		BaseBranch: ctx.BaseBranch,
 		States:     []string{"OPEN"},
 		Fields:     []string{"url"},
@@ -321,7 +323,7 @@ func createRun(opts *CreateOptions) error {
 	}
 	if err == nil {
 		return fmt.Errorf("a pull request for branch %q into branch %q already exists:\n%s",
-			ctx.HeadBranchLabel, ctx.BaseBranch, existingPR.URL)
+			ctx.PrRefs.GetPRHeadLabel(), ctx.BaseBranch, existingPR.URL)
 	}
 
 	message := "\nCreating pull request for %s into %s in %s\n\n"
@@ -336,9 +338,9 @@ func createRun(opts *CreateOptions) error {
 
 	if opts.IO.CanPrompt() {
 		fmt.Fprintf(opts.IO.ErrOut, message,
-			cs.Cyan(ctx.HeadBranchLabel),
+			cs.Cyan(ctx.PrRefs.GetPRHeadLabel()),
 			cs.Cyan(ctx.BaseBranch),
-			ghrepo.FullName(ctx.BaseRepo))
+			ghrepo.FullName(ctx.PrRefs.BaseRepo))
 	}
 
 	if !opts.EditorMode && (opts.FillVerbose || opts.Autofill || opts.FillFirst || (opts.TitleProvided && opts.BodyProvided)) {
@@ -361,7 +363,7 @@ func createRun(opts *CreateOptions) error {
 		action = shared.SubmitDraftAction
 	}
 
-	tpl := shared.NewTemplateManager(client.HTTP(), ctx.BaseRepo, opts.Prompter, opts.RootDirOverride, opts.RepoOverride == "", true)
+	tpl := shared.NewTemplateManager(client.HTTP(), ctx.PrRefs.BaseRepo, opts.Prompter, opts.RootDirOverride, opts.RepoOverride == "", true)
 
 	if opts.EditorMode {
 		if opts.Template != "" {
@@ -429,7 +431,7 @@ func createRun(opts *CreateOptions) error {
 		}
 
 		allowPreview := !state.HasMetadata() && shared.ValidURL(openURL) && !opts.DryRun
-		allowMetadata := ctx.BaseRepo.ViewerCanTriage()
+		allowMetadata := ctx.PrRefs.BaseRepo.(*api.Repository).ViewerCanTriage()
 		action, err = shared.ConfirmPRSubmission(opts.Prompter, allowPreview, allowMetadata, state.Draft)
 		if err != nil {
 			return fmt.Errorf("unable to confirm: %w", err)
@@ -439,10 +441,10 @@ func createRun(opts *CreateOptions) error {
 			fetcher := &shared.MetadataFetcher{
 				IO:        opts.IO,
 				APIClient: client,
-				Repo:      ctx.BaseRepo,
+				Repo:      ctx.PrRefs.BaseRepo,
 				State:     state,
 			}
-			err = shared.MetadataSurvey(opts.Prompter, opts.IO, ctx.BaseRepo, fetcher, state)
+			err = shared.MetadataSurvey(opts.Prompter, opts.IO, ctx.PrRefs.BaseRepo, fetcher, state)
 			if err != nil {
 				return err
 			}
@@ -486,7 +488,7 @@ var regexPattern = regexp.MustCompile(`(?m)^`)
 
 func initDefaultTitleBody(ctx CreateContext, state *shared.IssueMetadataState, useFirstCommit bool, addBody bool) error {
 	baseRef := ctx.BaseTrackingBranch
-	headRef := ctx.HeadBranch
+	headRef := ctx.PrRefs.BranchName
 	gitClient := ctx.GitClient
 
 	commits, err := gitClient.Commits(context.Background(), baseRef, headRef)
@@ -518,90 +520,13 @@ func initDefaultTitleBody(ctx CreateContext, state *shared.IssueMetadataState, u
 	return nil
 }
 
-// TODO: Replace with the finder's PullRequestRefs struct
-// trackingRef represents a ref for a remote tracking branch.
-type trackingRef struct {
-	remoteName string
-	branchName string
-}
-
-func (r trackingRef) String() string {
-	return "refs/remotes/" + r.remoteName + "/" + r.branchName
-}
-
-func mustParseTrackingRef(text string) trackingRef {
-	parts := strings.SplitN(string(text), "/", 4)
-	// The only place this is called is tryDetermineTrackingRef, where we are reconstructing
-	// the same tracking ref we passed in. If it doesn't match the expected format, this is a
-	// programmer error we want to know about, so it's ok to panic.
-	if len(parts) != 4 {
-		panic(fmt.Errorf("tracking ref should have four parts: %s", text))
-	}
-	if parts[0] != "refs" || parts[1] != "remotes" {
-		panic(fmt.Errorf("tracking ref should start with refs/remotes/: %s", text))
-	}
-
-	return trackingRef{
-		remoteName: parts[2],
-		branchName: parts[3],
-	}
-}
-
-// tryDetermineTrackingRef is intended to try and find a remote branch on the same commit as the currently checked out
-// HEAD, i.e. the local branch. If there are multiple branches that might match, the first remote is chosen, which in
-// practice is determined by the sorting algorithm applied much earlier in the process, roughly "upstream", "github", "origin",
-// and then everything else unstably sorted.
-func tryDetermineTrackingRef(gitClient *git.Client, remotes ghContext.Remotes, localBranchName string, headBranchConfig git.BranchConfig) (trackingRef, bool) {
-	// To try and determine the tracking ref for a local branch, we first construct a collection of refs
-	// that might be tracking, given the current branch's config, and the list of known remotes.
-	refsForLookup := []string{"HEAD"}
-	if headBranchConfig.RemoteName != "" && headBranchConfig.MergeRef != "" {
-		tr := trackingRef{
-			remoteName: headBranchConfig.RemoteName,
-			branchName: strings.TrimPrefix(headBranchConfig.MergeRef, "refs/heads/"),
-		}
-		refsForLookup = append(refsForLookup, tr.String())
-	}
-
-	for _, remote := range remotes {
-		tr := trackingRef{
-			remoteName: remote.Name,
-			branchName: localBranchName,
-		}
-		refsForLookup = append(refsForLookup, tr.String())
-	}
-
-	// Then we ask git for details about these refs, for example, refs/remotes/origin/trunk might return a hash
-	// for the remote tracking branch, trunk, for the remote, origin. If there is no ref, the git client returns
-	// no ref information.
-	//
-	// We also first check for the HEAD ref, so that we have the hash of the currently checked out commit.
-	resolvedRefs, _ := gitClient.ShowRefs(context.Background(), refsForLookup)
-
-	// If there is more than one resolved ref, that means that at least one ref was found in addition to the HEAD.
-	if len(resolvedRefs) > 1 {
-		headRef := resolvedRefs[0]
-		for _, r := range resolvedRefs[1:] {
-			// If the hash of the remote ref doesn't match the hash of HEAD then the remote branch is not in the same
-			// state, so it can't be used.
-			if r.Hash != headRef.Hash {
-				continue
-			}
-			// Otherwise we can parse the returned ref into a tracking ref and return that
-			return mustParseTrackingRef(r.Name), true
-		}
-	}
-
-	return trackingRef{}, false
-}
-
 func NewIssueState(ctx CreateContext, opts CreateOptions) (*shared.IssueMetadataState, error) {
 	var milestoneTitles []string
 	if opts.Milestone != "" {
 		milestoneTitles = []string{opts.Milestone}
 	}
 
-	meReplacer := shared.NewMeReplacer(ctx.Client, ctx.BaseRepo.RepoHost())
+	meReplacer := shared.NewMeReplacer(ctx.Client, ctx.PrRefs.BaseRepo.RepoHost())
 	assignees, err := meReplacer.ReplaceSlice(opts.Assignees)
 	if err != nil {
 		return nil, err
@@ -628,6 +553,7 @@ func NewIssueState(ctx CreateContext, opts CreateOptions) (*shared.IssueMetadata
 }
 
 func NewCreateContext(opts *CreateOptions) (*CreateContext, error) {
+	ctx := context.Background()
 	httpClient, err := opts.HttpClient()
 	if err != nil {
 		return nil, err
@@ -638,19 +564,26 @@ func NewCreateContext(opts *CreateOptions) (*CreateContext, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	gitClient := opts.GitClient
+	if ucc, err := gitClient.UncommittedChangeCount(ctx); err == nil && ucc > 0 {
+		fmt.Fprintf(opts.IO.ErrOut, "Warning: %s\n", text.Pluralize(ucc, "uncommitted change"))
+	}
+
+	// Resolve base repo
 	repoContext, err := ghContext.ResolveRemotesToRepos(remotes, client, opts.RepoOverride)
 	if err != nil {
 		return nil, err
 	}
 
-	var baseRepo *api.Repository
+	var targetBaseRepo *api.Repository
 	if br, err := repoContext.BaseRepo(opts.IO); err == nil {
 		if r, ok := br.(*api.Repository); ok {
-			baseRepo = r
+			targetBaseRepo = r
 		} else {
 			// TODO: if RepoNetwork is going to be requested anyway in `repoContext.HeadRepos()`,
 			// consider piggybacking on that result instead of performing a separate lookup
-			baseRepo, err = api.GitHubRepo(client, br)
+			targetBaseRepo, err = api.GitHubRepo(client, br)
 			if err != nil {
 				return nil, err
 			}
@@ -659,64 +592,112 @@ func NewCreateContext(opts *CreateOptions) (*CreateContext, error) {
 		return nil, err
 	}
 
-	isPushEnabled := false
-	headBranch := opts.HeadBranch
-	headBranchLabel := opts.HeadBranch
-	if headBranch == "" {
-		headBranch, err = opts.Branch()
+	// Resolve target head branch name from either
+	// --head or the current branch.
+	var targetHeadBranch string
+	var targetHeadRepoOwner string
+
+	promptForHeadRepo := true
+
+	if opts.HeadBranch != "" {
+		promptForHeadRepo = false
+		targetHeadBranch = opts.HeadBranch
+		// If the --head provided contains a colon, that means
+		// this is <user>:<branch> syntax.
+		if idx := strings.IndexRune(opts.HeadBranch, ':'); idx >= 0 {
+			targetHeadRepoOwner = opts.HeadBranch[:idx]
+			targetHeadBranch = opts.HeadBranch[idx+1:]
+		}
+	} else {
+		// Use the current branch as the target local head branch when
+		// --head is not provided.
+		targetHeadBranch, err = opts.Branch()
 		if err != nil {
 			return nil, fmt.Errorf("could not determine the current branch: %w", err)
 		}
-		headBranchLabel = headBranch
-		isPushEnabled = true
-	} else if idx := strings.IndexRune(headBranch, ':'); idx >= 0 {
-		headBranch = headBranch[idx+1:]
 	}
 
-	gitClient := opts.GitClient
-	if ucc, err := gitClient.UncommittedChangeCount(context.Background()); err == nil && ucc > 0 {
-		fmt.Fprintf(opts.IO.ErrOut, "Warning: %s\n", text.Pluralize(ucc, "uncommitted change"))
-	}
-
-	var headRepo ghrepo.Interface
-	var headRemote *ghContext.Remote
-
-	headBranchConfig, err := gitClient.ReadBranchConfig(context.Background(), headBranch)
+	targetHeadBranchConfig, err := gitClient.ReadBranchConfig(ctx, targetHeadBranch)
 	if err != nil {
 		return nil, err
 	}
-	if isPushEnabled {
-		// TODO: This doesn't respect the @{push} revision resolution or triagular workflows assembled with
-		// remote.pushDefault, or branch.<branchName>.pushremote config settings. The finder's ParsePRRefs
-		// may be able to replace this function entirely.
-		if trackingRef, found := tryDetermineTrackingRef(gitClient, remotes, headBranch, headBranchConfig); found {
-			isPushEnabled = false
-			if r, err := remotes.FindByName(trackingRef.remoteName); err == nil {
-				headRepo = r
-				headRemote = r
-				headBranchLabel = trackingRef.branchName
-				if !ghrepo.IsSame(baseRepo, headRepo) {
-					headBranchLabel = fmt.Sprintf("%s:%s", headRepo.RepoOwner(), trackingRef.branchName)
+
+	// See if we can determine if this branch has been push previously with
+	// Git configurations and @{push} revision syntax.
+	remotePushDefault, err := opts.GitClient.RemotePushDefault(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// Suppressing these errors as we have other means of computing the PullRequestRefs when these fail.
+	parsedPushRevision, _ := gitClient.ParsePushRevision(ctx, targetHeadBranch)
+	pushDefault, err := gitClient.PushDefault(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	prRefs, err := shared.ParsePRRefs(targetHeadBranch, targetHeadBranchConfig, parsedPushRevision, pushDefault, remotePushDefault, targetBaseRepo, remotes)
+	if err != nil {
+		return nil, err
+	}
+
+	// If the --head provided contains <user>:<branch>  syntax, we need to use
+	// the provided owner instead of the owner of the base repository.
+	if targetHeadRepoOwner != "" {
+		prRefs.HeadRepo = ghrepo.New(targetHeadRepoOwner, prRefs.HeadRepo.RepoName())
+	}
+
+	var headRemote *ghContext.Remote
+
+	// We received the head repository and branch from ParsePRRefs, or inferred
+	// it from --head input, but we need to check if it's up-to-date with
+	// our local branch state.
+	// If it is, we can use it as the head repo for the PR
+	// and avoid prompting the user.
+	// Errors raised here should not cause command to fail,
+	// prompt user for head repo if an error is raised or no remote found.
+	if prRefs.HasHead() {
+		// Check if the head branch is up-to-date with the local branch
+		headRemote, err := remotes.FindByRepo(prRefs.HeadRepo.RepoOwner(), prRefs.HeadRepo.RepoName())
+		if headRemote != nil && err == nil {
+			headRefName := fmt.Sprintf("refs/remotes/%s/%s", headRemote, prRefs.BranchName)
+			refsForLookup := []string{"HEAD", headRefName}
+			resolvedRefs, err := gitClient.ShowRefs(ctx, refsForLookup)
+
+			// If there is more than one resolved ref, then remote head ref was resolved.
+			if err == nil && len(resolvedRefs) > 1 {
+				headRef := resolvedRefs[0]
+				for _, r := range resolvedRefs[1:] {
+					// If the head ref is the same as the remote head ref,
+					// then the remote head is current and we can use it.
+					if r.Hash == headRef.Hash {
+						promptForHeadRepo = false
+						break
+					}
 				}
 			}
 		}
 	}
 
-	// otherwise, ask the user for the head repository using info obtained from the API
-	if headRepo == nil && isPushEnabled && opts.IO.CanPrompt() {
+	var forkHeadRepo bool
+	var isPushEnabled bool
+
+	if promptForHeadRepo && opts.IO.CanPrompt() {
+		isPushEnabled = true
+		// Since we could not determine a head ref, prompt the user for the head repository to push
+		// using a list of repositories obtained from the API
 		pushableRepos, err := repoContext.HeadRepos()
 		if err != nil {
 			return nil, err
 		}
 
 		if len(pushableRepos) == 0 {
-			pushableRepos, err = api.RepoFindForks(client, baseRepo, 3)
+			pushableRepos, err = api.RepoFindForks(client, prRefs.BaseRepo, 3)
 			if err != nil {
 				return nil, err
 			}
 		}
 
-		currentLogin, err := api.CurrentLoginName(client, baseRepo.RepoHost())
+		currentLogin, err := api.CurrentLoginName(client, prRefs.BaseRepo.RepoHost())
 		if err != nil {
 			return nil, err
 		}
@@ -731,61 +712,57 @@ func NewCreateContext(opts *CreateOptions) (*CreateContext, error) {
 		}
 
 		if !hasOwnFork {
-			pushOptions = append(pushOptions, "Create a fork of "+ghrepo.FullName(baseRepo))
+			pushOptions = append(pushOptions, "Create a fork of "+ghrepo.FullName(prRefs.BaseRepo))
 		}
 		pushOptions = append(pushOptions, "Skip pushing the branch")
 		pushOptions = append(pushOptions, "Cancel")
 
-		selectedOption, err := opts.Prompter.Select(fmt.Sprintf("Where should we push the '%s' branch?", headBranch), "", pushOptions)
+		selectedOption, err := opts.Prompter.Select(fmt.Sprintf("Where should we push the '%s' branch?", prRefs.BranchName), "", pushOptions)
 		if err != nil {
 			return nil, err
 		}
 
 		if selectedOption < len(pushableRepos) {
-			headRepo = pushableRepos[selectedOption]
-			if !ghrepo.IsSame(baseRepo, headRepo) {
-				headBranchLabel = fmt.Sprintf("%s:%s", headRepo.RepoOwner(), headBranch)
-			}
+			prRefs.HeadRepo = pushableRepos[selectedOption]
 		} else if pushOptions[selectedOption] == "Skip pushing the branch" {
 			isPushEnabled = false
 		} else if pushOptions[selectedOption] == "Cancel" {
 			return nil, cmdutil.CancelError
 		} else {
 			// "Create a fork of ..."
-			headBranchLabel = fmt.Sprintf("%s:%s", currentLogin, headBranch)
+			forkHeadRepo = true
+			prRefs.HeadRepo = ghrepo.New(currentLogin, prRefs.HeadRepo.RepoName())
 		}
 	}
 
-	if headRepo == nil && isPushEnabled && !opts.IO.CanPrompt() {
+	if prRefs.HeadRepo == nil && isPushEnabled && !opts.IO.CanPrompt() {
 		fmt.Fprintf(opts.IO.ErrOut, "aborted: you must first push the current branch to a remote, or use the --head flag")
 		return nil, cmdutil.SilentError
 	}
 
 	baseBranch := opts.BaseBranch
 	if baseBranch == "" {
-		baseBranch = headBranchConfig.MergeBase
+		baseBranch = targetHeadBranchConfig.MergeBase
 	}
 	if baseBranch == "" {
-		baseBranch = baseRepo.DefaultBranchRef.Name
+		baseBranch = targetBaseRepo.DefaultBranchRef.Name
 	}
-	if headBranch == baseBranch && headRepo != nil && ghrepo.IsSame(baseRepo, headRepo) {
+	if prRefs.BranchName == baseBranch && prRefs.HeadRepo != nil && ghrepo.IsSame(prRefs.BaseRepo, prRefs.HeadRepo) {
 		return nil, fmt.Errorf("must be on a branch named differently than %q", baseBranch)
 	}
 
 	baseTrackingBranch := baseBranch
-	if baseRemote, err := remotes.FindByRepo(baseRepo.RepoOwner(), baseRepo.RepoName()); err == nil {
+	if baseRemote, err := remotes.FindByRepo(prRefs.BaseRepo.RepoOwner(), prRefs.BaseRepo.RepoName()); err == nil {
 		baseTrackingBranch = fmt.Sprintf("%s/%s", baseRemote.Name, baseBranch)
 	}
 
 	return &CreateContext{
-		BaseRepo:           baseRepo,
-		HeadRepo:           headRepo,
-		BaseBranch:         baseBranch,
+		PrRefs:             prRefs,
+		BaseBranch:         baseBranch, // Currently not supported by shared.PullRequestRefs struct
 		BaseTrackingBranch: baseTrackingBranch,
-		HeadBranch:         headBranch,
-		HeadBranchLabel:    headBranchLabel,
 		HeadRemote:         headRemote,
-		IsPushEnabled:      isPushEnabled,
+		isPushEnabled:      isPushEnabled,
+		forkHeadRepo:       forkHeadRepo,
 		RepoContext:        repoContext,
 		Client:             client,
 		GitClient:          gitClient,
@@ -813,7 +790,7 @@ func submitPR(opts CreateOptions, ctx CreateContext, state shared.IssueMetadataS
 		"body":                state.Body,
 		"draft":               state.Draft,
 		"baseRefName":         ctx.BaseBranch,
-		"headRefName":         ctx.HeadBranchLabel,
+		"headRefName":         ctx.PrRefs.GetPRHeadLabel(),
 		"maintainerCanModify": opts.MaintainerCanModify,
 	}
 
@@ -821,7 +798,7 @@ func submitPR(opts CreateOptions, ctx CreateContext, state shared.IssueMetadataS
 		return errors.New("pull request title must not be blank")
 	}
 
-	err := shared.AddMetadataToIssueParams(client, ctx.BaseRepo, params, &state)
+	err := shared.AddMetadataToIssueParams(client, ctx.PrRefs.BaseRepo, params, &state)
 	if err != nil {
 		return err
 	}
@@ -835,7 +812,9 @@ func submitPR(opts CreateOptions, ctx CreateContext, state shared.IssueMetadataS
 	}
 
 	opts.IO.StartProgressIndicator()
-	pr, err := api.CreatePullRequest(client, ctx.BaseRepo, params)
+	// At this point, ctx.PrRefs.BaseRepo is guaranteed to be an *api.Repository
+	// because of https://github.com/cli/cli/blob/d29db2d44199ad4a987ea866f3f4ff601b1c90a0/pkg/cmd/pr/create/create.go#L578-L592
+	pr, err := api.CreatePullRequest(client, ctx.PrRefs.BaseRepo.(*api.Repository), params)
 	opts.IO.StopProgressIndicator()
 	if pr != nil {
 		fmt.Fprintln(opts.IO.Out, pr.URL)
@@ -932,7 +911,7 @@ func previewPR(opts CreateOptions, openURL string) error {
 
 func handlePush(opts CreateOptions, ctx CreateContext) error {
 	didForkRepo := false
-	headRepo := ctx.HeadRepo
+	headRepo := ctx.PrRefs.HeadRepo
 	headRemote := ctx.HeadRemote
 	client := ctx.Client
 	gitClient := ctx.GitClient
@@ -940,9 +919,9 @@ func handlePush(opts CreateOptions, ctx CreateContext) error {
 	var err error
 	// if a head repository could not be determined so far, automatically create
 	// one by forking the base repository
-	if headRepo == nil && ctx.IsPushEnabled {
+	if ctx.forkHeadRepo && ctx.isPushEnabled {
 		opts.IO.StartProgressIndicator()
-		headRepo, err = api.ForkRepo(client, ctx.BaseRepo, "", "", false)
+		headRepo, err = api.ForkRepo(client, ctx.PrRefs.BaseRepo, "", "", false)
 		opts.IO.StopProgressIndicator()
 		if err != nil {
 			return fmt.Errorf("error forking repo: %w", err)
@@ -962,7 +941,7 @@ func handlePush(opts CreateOptions, ctx CreateContext) error {
 	// can push to it. We will try to add the head repo as the "origin" remote
 	// and fallback to the "fork" remote if it is unavailable. Also, if the
 	// base repo is the "origin" remote we will rename it "upstream".
-	if headRemote == nil && ctx.IsPushEnabled {
+	if headRemote == nil && ctx.isPushEnabled {
 		cfg, err := opts.Config()
 		if err != nil {
 			return err
@@ -985,7 +964,7 @@ func handlePush(opts CreateOptions, ctx CreateContext) error {
 			remoteName = "fork"
 		}
 
-		if origin != nil && upstream == nil && ghrepo.IsSame(origin, ctx.BaseRepo) {
+		if origin != nil && upstream == nil && ghrepo.IsSame(origin, ctx.PrRefs.BaseRepo) {
 			renameCmd, err := gitClient.Command(context.Background(), "remote", "rename", "origin", upstreamName)
 			if err != nil {
 				return err
@@ -994,7 +973,7 @@ func handlePush(opts CreateOptions, ctx CreateContext) error {
 				return fmt.Errorf("error renaming origin remote: %w", err)
 			}
 			remoteName = "origin"
-			fmt.Fprintf(opts.IO.ErrOut, "Changed %s remote to %q\n", ghrepo.FullName(ctx.BaseRepo), upstreamName)
+			fmt.Fprintf(opts.IO.ErrOut, "Changed %s remote to %q\n", ghrepo.FullName(ctx.PrRefs.BaseRepo), upstreamName)
 		}
 
 		gitRemote, err := gitClient.AddRemote(context.Background(), remoteName, headRepoURL, []string{})
@@ -1024,11 +1003,11 @@ func handlePush(opts CreateOptions, ctx CreateContext) error {
 	}
 
 	// automatically push the branch if it hasn't been pushed anywhere yet
-	if ctx.IsPushEnabled {
+	if ctx.isPushEnabled {
 		pushBranch := func() error {
 			w := NewRegexpWriter(opts.IO.ErrOut, gitPushRegexp, "")
 			defer w.Flush()
-			ref := fmt.Sprintf("HEAD:refs/heads/%s", ctx.HeadBranch)
+			ref := fmt.Sprintf("HEAD:refs/heads/%s", ctx.PrRefs.BranchName)
 			bo := backoff.NewConstantBackOff(2 * time.Second)
 			ctx := context.Background()
 			return backoff.Retry(func() error {
@@ -1055,10 +1034,10 @@ func handlePush(opts CreateOptions, ctx CreateContext) error {
 
 func generateCompareURL(ctx CreateContext, state shared.IssueMetadataState) (string, error) {
 	u := ghrepo.GenerateRepoURL(
-		ctx.BaseRepo,
+		ctx.PrRefs.BaseRepo,
 		"compare/%s...%s?expand=1",
-		url.PathEscape(ctx.BaseBranch), url.PathEscape(ctx.HeadBranchLabel))
-	url, err := shared.WithPrAndIssueQueryParams(ctx.Client, ctx.BaseRepo, u, state)
+		url.PathEscape(ctx.BaseBranch), url.PathEscape(ctx.PrRefs.GetPRHeadLabel()))
+	url, err := shared.WithPrAndIssueQueryParams(ctx.Client, ctx.PrRefs.BaseRepo, u, state)
 	if err != nil {
 		return "", err
 	}

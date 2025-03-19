@@ -99,19 +99,23 @@ type FindOptions struct {
 
 // TODO: Does this also need the BaseBranchName?
 // PR's are represented by the following:
-// baseRef -----PR-----> headRef
+// headRef -----PR-----> baseRef
 //
 // A ref is described as "remoteName/branchName", so
-// baseRepoName/baseBranchName -----PR-----> headRepoName/headBranchName
+// headRepoName/headBranchName -----PR-----> baseRepoName/baseBranchName
 type PullRequestRefs struct {
 	BranchName string
 	HeadRepo   ghrepo.Interface
 	BaseRepo   ghrepo.Interface
 }
 
+func (s *PullRequestRefs) HasHead() bool {
+	return s.HeadRepo != nil && s.BranchName != ""
+}
+
 // GetPRHeadLabel returns the string that the GitHub API uses to identify the PR. This is
 // either just the branch name or, if the PR is originating from a fork, the fork owner
-// and the branch name, like <owner>:<branch>.
+// and the branch name, like <user>:<branch>.
 func (s *PullRequestRefs) GetPRHeadLabel() string {
 	if ghrepo.IsSame(s.HeadRepo, s.BaseRepo) {
 		return s.BranchName
