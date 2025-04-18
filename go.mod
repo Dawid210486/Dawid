@@ -19,7 +19,7 @@ require (
 	github.com/creack/pty v1.1.24
 	github.com/digitorus/timestamp v0.0.0-20231217203849-220c5c2851b7
 	github.com/distribution/reference v0.6.0
-	github.com/gabriel-vasile/mimetype v1.4.8
+	github.com/gabriel-vasile/mimetype v1.4.9
 	github.com/gdamore/tcell/v2 v2.5.4
 	github.com/golang/snappy v0.0.4
 	github.com/google/go-cmp v0.6.0
@@ -46,10 +46,10 @@ require (
 	github.com/spf13/pflag v1.0.6
 	github.com/stretchr/testify v1.10.0
 	github.com/zalando/go-keyring v0.2.6
-	golang.org/x/crypto v0.35.0
-	golang.org/x/sync v0.11.0
-	golang.org/x/term v0.29.0
-	golang.org/x/text v0.22.0
+	golang.org/x/crypto v0.37.0
+	golang.org/x/sync v0.13.0
+	golang.org/x/term v0.31.0
+	golang.org/x/text v0.24.0
 	google.golang.org/grpc v1.69.4
 	google.golang.org/protobuf v1.36.5
 	gopkg.in/h2non/gock.v1 v1.1.2
@@ -158,8 +158,8 @@ require (
 	go.uber.org/zap v1.27.0 // indirect
 	golang.org/x/exp v0.0.0-20240325151524-a685a6edb6d8 // indirect
 	golang.org/x/mod v0.22.0 // indirect
-	golang.org/x/net v0.36.0 // indirect
-	golang.org/x/sys v0.30.0 // indirect
+	golang.org/x/net v0.39.0 // indirect
+	golang.org/x/sys v0.32.0 // indirect
 	golang.org/x/tools v0.29.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20241209162323-e6fa225c2576 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20250102185135-69823020774d // indirect
